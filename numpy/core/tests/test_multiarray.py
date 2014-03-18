@@ -7,10 +7,13 @@ import shutil
 import warnings
 import operator
 import io
+import zipfile
 if sys.version_info[0] >= 3:
     import builtins
+    from io import BytesIO
 else:
     import __builtin__ as builtins
+    from StringIO import StringIO as BytesIO
 from decimal import Decimal
 
 
@@ -2523,6 +2526,51 @@ class TestIO(object):
                          array([1, 2, 3, 4]),
                          dtype='<f4')
 
+    def test_from_bytesio(self):
+        self.x.tofile(self.filename)
+        contents = open(self.filename).read()
+ 
+        file_like = BytesIO(contents)
+        got = np.fromfile(file_like, dtype=self.dtype)
+ 
+        assert_array_equal(got, self.x.flat)
+ 
+    def test_from_zipfile(self):
+        self.x.tofile(self.filename)
+        zip_filename = tempfile.mkstemp(dir=self.tempdir)
+        zip_file = zipfile.ZipFile(zip_filename, "w")
+        zip_file.write(self.filename, os.path.basename(self.filename))
+        zip_file.close()
+ 
+        zip_file = zipfile.ZipFile(zip_filename)
+        f = zip_file.open(os.path.basename(self.filename))
+ 
+        got = np.fromfile(f, dtype=self.dtype)
+        assert_array_equal(got, self.x.flat)
+ 
+    def test_from_filelike_with_read_exception(self):
+        class FileLike(object):
+            def read(self, *args):
+                raise ValueError
+            def close(self):
+                pass
+
+        assert_raises(ValueError, np.fromfile, FileLike())
+ 
+    def test_from_filelike_with_close_exception(self):
+        self.x.tofile(self.filename)
+        f = open(self.filename)
+ 
+        class FileLike(object):
+            def __init__(self):
+                self.f = f
+            def read(self, *args):
+                return self.f.read()
+            def close(self):
+                raise ValueError
+    
+        assert_raises(ValueError, np.fromfile, FileLike())
+ 
     @dec.slow # takes > 1 minute on mechanical hard drive
     def test_big_binary(self):
         """Test workarounds for 32-bit limited fwrite, fseek, and ftell

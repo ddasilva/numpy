@@ -38,6 +38,11 @@
 typedef int (*next_element)(void **, void *, PyArray_Descr *, void *);
 typedef int (*skip_separator)(void **, const char *, void *);
 
+typedef struct {
+    void *data;
+    size_t size;
+} FromFileBuff;
+
 static int
 fromstr_next_element(char **s, void *dptr, PyArray_Descr *dtype,
                      const char *end)
@@ -55,6 +60,78 @@ fromfile_next_element(FILE **fp, void *dptr, PyArray_Descr *dtype,
 {
     /* the NULL argument is for backwards-compatibility */
     return dtype->f->scanfunc(*fp, dptr, NULL, dtype);
+}
+
+
+static int
+fromfilelike_next_element(PyObject **obj, void *dptr, PyArray_Descr *dtype,
+                          FromFileBuff *buff)
+{
+    printf("--calling fromfilelike_next_element()\n");
+
+    /* Using string-reading mechanism to read from buff that is no larger
+     * that max_el_size bytes. When obj.read() returns empty string, return
+     * loop-terminating value.
+     */
+    const int max_el_size = 1 << 20;
+    PyObject *tmp;
+    char *s;
+    int slen, offset, ret;
+    void *orig_addr, *new_data;
+
+    printf("----buff=%s\n", buff->data);
+
+    // replace buff if less than max_el_size; calls obj.read()
+    if (buff->size < max_el_size) {
+        tmp = PyObject_CallMethod(*obj, "read", "i", max_el_size);
+        
+        if (tmp == NULL || ! PyString_Check(tmp)) {
+            return -2;
+        }
+        
+        s = PyString_AsString(tmp);
+        slen = sizeof(char)*PyString_Size(tmp);
+
+        if (buff->data == NULL) {
+            buff->data = malloc(slen);
+            buff->size = slen;
+            memcpy(buff->data, s, slen);
+        } 
+        else {
+            new_data = malloc(buff->size + slen);
+            memcpy(new_data, buff->data, buff->size);
+            memcpy(new_data + buff->size, s, slen);
+            free(buff->data);
+            buff->data = new_data;
+            buff->size = buff->size + slen;
+        }
+
+        Py_DECREF(tmp);
+    }
+
+    // terminate if buffer is empty
+    if (buff->size == 0) {
+        return -1;
+    }
+
+    // pass fromstr_next_element a reference to a copy of the buffer string,
+    // and calculate the offset set to determine length to advance.
+    s = malloc(buff->size);
+    memcpy(s, buff->data, buff->size);   
+    orig_addr = s;
+
+    ret = fromstr_next_element(&s, dptr, dtype, s + buff->size);
+    offset = (void*)s - orig_addr;
+    
+    // advance buffer (consume offset bytes)
+    new_data = malloc(buff->size - offset);
+    memcpy(new_data, s, buff->size - offset);
+
+    free(buff->data);
+    buff->data = new_data;
+    buff->size = buff->size - offset;
+
+    return ret;
 }
 
 /*
@@ -164,6 +241,71 @@ fromfile_skip_separator(FILE **fp, const char *sep, void *NPY_UNUSED(stream_data
     const char *sep_start = sep;
 
     while (1) {
+        int c = fgetc(*fp);
+
+        if (c == EOF) {
+            result = -1;
+            break;
+        }
+        else if (*sep == '\0') {
+            ungetc(c, *fp);
+            if (sep != sep_start) {
+                /* matched separator */
+                result = 0;
+                break;
+            }
+            else {
+                /* separator was whitespace wildcard that didn't match */
+                result = -2;
+                break;
+            }
+        }
+        else if (*sep == ' ') {
+            /* whitespace wildcard */
+            if (!isspace(c)) {
+                sep++;
+                sep_start++;
+                ungetc(c, *fp);
+            }
+            else if (sep == sep_start) {
+                sep_start--;
+            }
+        }
+        else if (*sep != c) {
+            ungetc(c, *fp);
+            result = -2;
+            break;
+        }
+        else {
+            sep++;
+        }
+    }
+    return result;
+}
+
+
+static int
+fromfilelike_skip_separator(PyObject **obj, const char *sep, void *buff)
+{
+    printf("--calling fromfilelike_skip_seperator()\n");
+    int result = 0;
+    const char *sep_start = sep;
+    char buff;
+    char *tmp;
+    int use_buff = 0;
+
+
+    while (1) {
+        int c;
+
+        if (use_buff) {
+            c = buff;
+            use_buff = 0;
+        }
+        else {
+            tmp 
+        }
+
         int c = fgetc(*fp);
 
         if (c == EOF) {
@@ -3135,6 +3277,77 @@ PyArray_ArangeObj(PyObject *start, PyObject *stop, PyObject *step, PyArray_Descr
     return NULL;
 }
 
+/* Create a PyArrayObject from a file-like object with binary data.
+ *
+ * Args
+ * ------
+ * file       The file-like Python object
+ * dtype      Datatype of the array to create
+ */
+static PyArrayObject *
+array_fromfilelike_binary(PyObject *file, PyArray_Descr *dtype, npy_intp num, size_t *nread)
+{
+    size_t data_size, data_used, chunk_size;
+    void *data;
+    PyObject *tmp;
+    PyArrayObject *ret;
+
+    /* Call .read() repetitively, copying int array (and resizign when neccessary).
+     * It is implemented this way because there is no garuntee the file-like object
+     * provides a mechanism for determining its size prior to reading.
+     */
+    data_size = 1 << 20;
+    data_used = 0;
+    data = malloc(data_size); 
+
+    while (1) {
+        tmp = PyObject_CallMethod(file, "read", "i", 1 << 20);
+
+        if (tmp == NULL) {
+            return NULL;
+        }
+        if (PyString_Size(tmp) == 0) {
+            Py_DECREF(tmp);
+            break;
+        }        
+
+        chunk_size = sizeof(char) * PyString_Size(tmp);
+
+        while (data_used + chunk_size > data_size) {
+            data_size *= 2;
+            data = realloc(data, data_size);
+        }
+        
+        memcpy(data + data_used, PyString_AsString(tmp), chunk_size);        
+        data_used += chunk_size;
+        Py_DECREF(tmp);
+
+        if (0 <= num && num <= data_used / dtype->elsize) {
+            break;
+        }
+    }
+
+    /* Create array object and copy data into it. */
+    if (num < 0) {
+        num = data_used / dtype->elsize;
+    }
+
+    ret = (PyArrayObject *)PyArray_NewFromDescr(&PyArray_Type,
+                                                dtype,
+                                                1, &num,
+                                                NULL, NULL,
+                                                0, NULL);
+    if (ret == NULL) {
+        return NULL;
+    }
+
+    memcpy(PyArray_DATA(ret), data, num * dtype->elsize);
+    free(data);
+
+    return ret;
+}
+
+
 static PyArrayObject *
 array_fromfile_binary(FILE *fp, PyArray_Descr *dtype, npy_intp num, size_t *nread)
 {
@@ -3180,6 +3393,7 @@ array_fromfile_binary(FILE *fp, PyArray_Descr *dtype, npy_intp num, size_t *nrea
     return r;
 }
 
+
 /*
  * Create an array by reading from the given stream, using the passed
  * next_element and skip_separator functions.
@@ -3214,13 +3428,17 @@ array_from_text(PyArray_Descr *dtype, npy_intp num, char *sep, size_t *nread,
         goto fail;
     }
 
-    NPY_BEGIN_ALLOW_THREADS;
     totalbytes = bytes = size * dtype->elsize;
     dptr = PyArray_DATA(r);
-    for (i= 0; num < 0 || i < num; i++) {
-        if (next(&stream, dptr, dtype, stream_data) < 0) {
+    for (i= 0; num < 0 || i < num; i++) {       
+        int rt = next(&stream, dptr, dtype, stream_data);
+        if (rt == -2) {
+            return NULL;
+        }
+        else if (rt < 0) {
             break;
         }
+
         *nread += 1;
         thisbuf += 1;
         dptr += dtype->elsize;
@@ -3249,7 +3467,6 @@ array_from_text(PyArray_Descr *dtype, npy_intp num, char *sep, size_t *nread,
             ((PyArrayObject_fields *)r)->data = tmp;
         }
     }
-    NPY_END_ALLOW_THREADS;
     free(clean_sep);
 
 fail:
@@ -3263,6 +3480,7 @@ fail:
     return r;
 }
 #undef FROM_BUFFER_SIZE
+
 
 /*NUMPY_API
  *
@@ -3313,7 +3531,7 @@ PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
         }
         ret = array_from_text(dtype, num, sep, &nread, fp,
                 (next_element) fromfile_next_element,
-                (skip_separator) fromfile_skip_separator, NULL);
+                (skip_separator) fromfile_skip_separator, NULL);        
     }
     if (ret == NULL) {
         Py_DECREF(dtype);
@@ -3333,6 +3551,64 @@ PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
     }
     return (PyObject *)ret;
 }
+
+
+NPY_NO_EXPORT PyObject *
+PyArray_FromFileLike(PyObject *file, PyArray_Descr *dtype, npy_intp num, char *sep)
+{
+    PyArrayObject *ret;
+    size_t nread = 0;
+
+    if (PyDataType_REFCHK(dtype)) {
+        PyErr_SetString(PyExc_ValueError,
+                "Cannot read into object array");
+        Py_DECREF(dtype);
+        return NULL;
+    }
+    if (dtype->elsize == 0) {
+        PyErr_SetString(PyExc_ValueError,
+                "The elements are 0-sized.");
+        Py_DECREF(dtype);
+        return NULL;
+    }
+    if ((sep == NULL) || (strlen(sep) == 0)) {
+        ret = array_fromfilelike_binary(file, dtype, num, &nread);
+    }
+    else {
+        if (dtype->f->scanfunc == NULL) {
+            PyErr_SetString(PyExc_ValueError,
+                    "Unable to read character files of that array type");
+            Py_DECREF(dtype);
+            return NULL;
+        }
+
+        FromFileBuff buff;
+        buff.data = NULL;
+        buff.size = 0;
+
+        ret = array_from_text(dtype, num, sep, &nread, file,
+                (next_element) fromfilelike_next_element,
+                (skip_separator) fromfilelike_skip_separator, &buff);
+    }
+    if (ret == NULL) {
+        Py_DECREF(dtype);
+        return NULL;
+    }
+    if (((npy_intp) nread) < num) {
+        /* Realloc memory for smaller number of elements */
+        const size_t nsize = PyArray_MAX(nread,1)*PyArray_DESCR(ret)->elsize;
+        char *tmp;
+
+        if((tmp = PyDataMem_RENEW(PyArray_DATA(ret), nsize)) == NULL) {
+            Py_DECREF(ret);
+            return PyErr_NoMemory();
+        }
+        ((PyArrayObject_fields *)ret)->data = tmp;
+        PyArray_DIMS(ret)[0] = nread;
+    }
+    return (PyObject *)ret;
+}
+
 
 /*NUMPY_API*/
 NPY_NO_EXPORT PyObject *
