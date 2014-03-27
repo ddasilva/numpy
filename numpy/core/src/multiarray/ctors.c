@@ -31,12 +31,72 @@
  * Reading from a file or a string.
  *
  * As much as possible, we try to use the same code for both files and strings,
- * so the semantics for fromstring and fromfile are the same, especially with
+ * so the semantics for fromstring and fromfilelike are the same, especially with
  * regards to the handling of text representations.
  */
 
 typedef int (*next_element)(void **, void *, PyArray_Descr *, void *);
 typedef int (*skip_separator)(void **, const char *, void *);
+
+typedef struct {
+    char *data;
+    size_t size;
+} NPyFileBuff;
+
+#define NPYFILEBUFF_WIDTH 4096
+
+
+/*
+ * Replenish NPyFileBuff so it is no less than NPYFILEBUFF_WIDTH bytes.
+ * when possible. If the file is exhausted, it may have less bytes.
+ *
+ * returns -1 if error calling file.read()
+ * returns  0 if successful
+ */
+static int
+NPyFileBuff_Replenish(NPyFileBuff *buff, PyObject *file)
+{
+    PyObject *tmp;
+    int len;
+
+    if (buff->size < NPYFILEBUFF_WIDTH) {
+        tmp = PyObject_CallMethod(file, "read", "i", NPYFILEBUFF_WIDTH);
+        if (tmp == NULL || ! PyString_Check(tmp)) {
+            return -1;
+        }
+        len = PyString_Size(tmp);
+
+        /* relloc and copy to end of data */
+        buff->data = realloc(buff->data, buff->size + len);
+        memcpy(buff->data + buff->size, PyString_AsString(tmp), len);
+        buff->size += len;
+
+        Py_DECREF(tmp);
+    }
+    return 0;
+}
+
+
+/*
+ * Drops the first character from a NPyFileBuff.
+ *
+ * returns -1 if buffer is empty
+ * returns  0 if successful
+ */
+int NPyFileBuff_DropFirst(NPyFileBuff *buff) {
+    if (buff->size == 0) {
+        return -1;
+    }
+
+    char *newdata = malloc(buff->size - 1);
+    memcpy(newdata, buff->data + 1, buff->size - 1);
+    free(buff->data);
+    buff->data = newdata;
+    buff->size--;
+
+    return 0;
+}
+
 
 static int
 fromstr_next_element(char **s, void *dptr, PyArray_Descr *dtype,
@@ -49,13 +109,50 @@ fromstr_next_element(char **s, void *dptr, PyArray_Descr *dtype,
     return r;
 }
 
+/*
+ * Implementation of next_element for file-like objects.
+ *
+ * returns -1 if end of file is reached
+ * returns -2 if exception in obj.read()
+ * returns >0 if successful
+ */
 static int
-fromfile_next_element(FILE **fp, void *dptr, PyArray_Descr *dtype,
-                      void *NPY_UNUSED(stream_data))
+fromfilelike_next_element(PyObject **file, void *dptr, PyArray_Descr *dtype,
+                          NPyFileBuff *buff)
 {
-    /* the NULL argument is for backwards-compatibility */
-    return dtype->f->scanfunc(*fp, dptr, NULL, dtype);
+    /*
+     * At the core, use the dtype->f->fromstr function on the buffer. This
+     * function gives us pointer back to the start of the text after the
+     * read element, and we do pointer arithmetic to subtract that amount
+     * from the buffer.
+     */
+    char *endptr, *newdata;
+    int delta, r;
+
+    if (NPyFileBuff_Replenish(buff, *file) < 0) {       
+        return -2;
+    }
+
+    if (buff->size == 0) {
+        return -1;
+    }
+
+    endptr = buff->data;
+    r = dtype->f->fromstr(buff->data, dptr, &endptr, dtype);
+
+    /* Subtract amount read from the beginning of buffer */
+    delta = endptr - buff->data;
+
+    newdata = malloc(buff->size - delta);
+    memcpy(newdata, buff->data + delta, buff->size - delta);
+
+    free(buff->data);
+    buff->data = newdata;
+    buff->size -= delta;
+
+    return r;
 }
+
 
 /*
  * Remove multiple whitespace from the separator, and add a space to the
@@ -102,6 +199,7 @@ swab_separator(const char *sep)
     *s = '\0';
     return start;
 }
+
 
 /*
  * Assuming that the separator is the next bit in the string (file), skip it.
@@ -157,21 +255,31 @@ fromstr_skip_separator(char **s, const char *sep, const char *end)
     return result;
 }
 
+/* Implemention of skip_separator for file-like objects.
+ *
+ * returns -2 if error calling obj.read()
+ * returns -1 to signal loop exit
+ * returns  0 on success with signal to continue
+ */
 static int
-fromfile_skip_separator(FILE **fp, const char *sep, void *NPY_UNUSED(stream_data))
+fromfilelike_skip_separator(PyObject **file, const char *sep, NPyFileBuff *buff)
 {
     int result = 0;
     const char *sep_start = sep;
 
     while (1) {
-        int c = fgetc(*fp);
+        if (NPyFileBuff_Replenish(buff, *file) < 0) {
+            return -2;
+        }
 
-        if (c == EOF) {
+        if (buff->size == 0) {
             result = -1;
             break;
         }
-        else if (*sep == '\0') {
-            ungetc(c, *fp);
+
+        int c = buff->data[0];
+
+        if (*sep == '\0') {
             if (sep != sep_start) {
                 /* matched separator */
                 result = 0;
@@ -179,7 +287,7 @@ fromfile_skip_separator(FILE **fp, const char *sep, void *NPY_UNUSED(stream_data
             }
             else {
                 /* separator was whitespace wildcard that didn't match */
-                result = -2;
+                result = -1;
                 break;
             }
         }
@@ -188,23 +296,28 @@ fromfile_skip_separator(FILE **fp, const char *sep, void *NPY_UNUSED(stream_data
             if (!isspace(c)) {
                 sep++;
                 sep_start++;
-                ungetc(c, *fp);
             }
             else if (sep == sep_start) {
                 sep_start--;
+                NPyFileBuff_DropFirst(buff);
+            }
+            else {
+                NPyFileBuff_DropFirst(buff);
             }
         }
         else if (*sep != c) {
-            ungetc(c, *fp);
             result = -2;
             break;
         }
         else {
             sep++;
+            NPyFileBuff_DropFirst(buff);
         }
     }
     return result;
 }
+
+
 
 /*
  * Change a sub-array field to the base descriptor
@@ -3180,6 +3293,72 @@ array_fromfile_binary(FILE *fp, PyArray_Descr *dtype, npy_intp num, size_t *nrea
     return r;
 }
 
+
+static PyArrayObject *
+array_fromfilelike_binary(PyObject *file, PyArray_Descr *dtype, npy_intp num, size_t *nread)
+{
+    size_t data_size, data_used, chunk_size;
+    void *data;
+    PyObject *tmp;
+    PyArrayObject *ret;
+    int orig_num = num;
+    /*
+     * Repeats call to file.read(), copying into C array. Resizes array
+     * as it goes along (dynamic array).
+     */
+    data_size = NPYFILEBUFF_WIDTH;
+    data_used = 0;
+    data = malloc(data_size); 
+
+    while (1) {
+        tmp = PyObject_CallMethod(file, "read", "i", NPYFILEBUFF_WIDTH);
+
+        if (tmp == NULL) {
+            return NULL;
+        }
+        if (PyString_Size(tmp) == 0) {
+            Py_DECREF(tmp);
+            break;
+        }        
+
+        chunk_size = sizeof(char) * PyString_Size(tmp);
+
+        while (data_used + chunk_size > data_size) {
+            data_size *= 2;
+            data = realloc(data, data_size);
+        }
+        
+        memcpy(data + data_used, PyString_AsString(tmp), chunk_size);        
+        data_used += chunk_size;
+        Py_DECREF(tmp);
+
+        if (0 <= num && num >= (data_used / dtype->elsize)) {
+            break;
+        }
+    }
+
+    /* Create array object and copy data into it. */
+    if (num < 0) {
+        num = data_used / dtype->elsize;
+    }
+
+    ret = (PyArrayObject *)PyArray_NewFromDescr(&PyArray_Type,
+                                                dtype,
+                                                1, &num,
+                                                NULL, NULL,
+                                                0, NULL);
+    if (ret == NULL) {
+        return NULL;
+    }
+
+    memcpy(PyArray_DATA(ret), data, num * dtype->elsize);
+    free(data);
+    *nread = num;
+
+    return ret;
+}
+
+
 /*
  * Create an array by reading from the given stream, using the passed
  * next_element and skip_separator functions.
@@ -3214,7 +3393,6 @@ array_from_text(PyArray_Descr *dtype, npy_intp num, char *sep, size_t *nread,
         goto fail;
     }
 
-    NPY_BEGIN_ALLOW_THREADS;
     totalbytes = bytes = size * dtype->elsize;
     dptr = PyArray_DATA(r);
     for (i= 0; num < 0 || i < num; i++) {
@@ -3249,7 +3427,6 @@ array_from_text(PyArray_Descr *dtype, npy_intp num, char *sep, size_t *nread,
             ((PyArrayObject_fields *)r)->data = tmp;
         }
     }
-    NPY_END_ALLOW_THREADS;
     free(clean_sep);
 
 fail:
@@ -3264,30 +3441,13 @@ fail:
 }
 #undef FROM_BUFFER_SIZE
 
-/*NUMPY_API
- *
- * Given a ``FILE *`` pointer ``fp``, and a ``PyArray_Descr``, return an
- * array corresponding to the data encoded in that file.
- *
- * If the dtype is NULL, the default array type is used (double).
- * If non-null, the reference is stolen.
- *
- * The number of elements to read is given as ``num``; if it is < 0, then
- * then as many as possible are read.
- *
- * If ``sep`` is NULL or empty, then binary data is assumed, else
- * text data, with ``sep`` as the separator between elements. Whitespace in
- * the separator matches any length of whitespace in the text, and a match
- * for whitespace around the separator is added.
- *
- * For memory-mapped files, use the buffer interface. No more data than
- * necessary is read by this routine.
- */
+
 NPY_NO_EXPORT PyObject *
-PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
+PyArray_FromFileLike(PyObject *file, PyArray_Descr *dtype, npy_intp num, char *sep)
 {
     PyArrayObject *ret;
     size_t nread = 0;
+    NPyFileBuff buff;
 
     if (PyDataType_REFCHK(dtype)) {
         PyErr_SetString(PyExc_ValueError,
@@ -3302,7 +3462,7 @@ PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
         return NULL;
     }
     if ((sep == NULL) || (strlen(sep) == 0)) {
-        ret = array_fromfile_binary(fp, dtype, num, &nread);
+        ret = array_fromfilelike_binary(file, dtype, num, &nread);
     }
     else {
         if (dtype->f->scanfunc == NULL) {
@@ -3311,9 +3471,18 @@ PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
             Py_DECREF(dtype);
             return NULL;
         }
-        ret = array_from_text(dtype, num, sep, &nread, fp,
-                (next_element) fromfile_next_element,
-                (skip_separator) fromfile_skip_separator, NULL);
+
+        buff.data = NULL;
+        buff.size = 0;
+
+        ret = array_from_text(dtype, num, sep, &nread, file,
+                              (next_element) fromfilelike_next_element,
+                              (skip_separator) fromfilelike_skip_separator,
+                              &buff);
+
+        if (buff.data != NULL) {
+            free(buff.data);
+        }
     }
     if (ret == NULL) {
         Py_DECREF(dtype);
@@ -3333,6 +3502,42 @@ PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
     }
     return (PyObject *)ret;
 }
+
+
+/*NUMPY_API
+ *
+ * Given a ``FILE *`` pointer ``fp``, and a ``PyArray_Descr``, return an
+ * array corresponding to the data encoded in that file.
+ *
+ * If the dtype is NULL, the default array type is used (double).
+ * If non-null, the reference is stolen.
+ *
+ * The number of elements to read is given as ``num``; if it is < 0, then
+ * then as many as possible are read.
+ *
+ * If ``sep`` is NULL or empty, then binary data is assumed, else
+ * text data, with ``sep`` as the separator between elements. Whitespace in
+ * the separator matches any length of whitespace in the text, and a match
+ * for whitespace around the separator is added.
+ *
+ * For memory-mapped files, use the buffer interface.
+ */
+NPY_NO_EXPORT PyObject *
+PyArray_FromFile(FILE *fp, PyArray_Descr *dtype, npy_intp num, char *sep)
+{
+    PyObject *file, *ret;
+
+#if defined(NPY_PY3K)
+    file = PyFile_FromFd(fp, NULL, -1, NULL, NULL, NULL, NULL, -1);
+#else
+    file = PyFile_FromFile(fp, "<generated>", "r", NULL);
+#endif
+
+    ret = PyArray_FromFileLike(file, dtype, num, sep);
+    Py_DECREF(file);
+    return ret;
+}
+
 
 /*NUMPY_API*/
 NPY_NO_EXPORT PyObject *

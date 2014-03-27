@@ -1949,6 +1949,24 @@ array_count_nonzero(PyObject *NPY_UNUSED(self), PyObject *args, PyObject *kwds)
 #endif
 }
 
+
+static int
+PyArray_IsFileLike(PyObject *obj)
+{
+    static char *needed_attrs[] = {"read", "close", NULL};
+    int i = 0;
+    
+    while (needed_attrs[i] != NULL) {
+        if (! PyObject_HasAttrString(obj, needed_attrs[i])) {
+            return 0;
+        }
+        i++;
+    }
+    
+    return 1;
+}
+
+
 static PyObject *
 array_fromstring(PyObject *NPY_UNUSED(ignored), PyObject *args, PyObject *keywds)
 {
@@ -1969,54 +1987,87 @@ array_fromstring(PyObject *NPY_UNUSED(ignored), PyObject *args, PyObject *keywds
 }
 
 
-
 static PyObject *
 array_fromfile(PyObject *NPY_UNUSED(ignored), PyObject *args, PyObject *keywds)
 {
-    PyObject *file = NULL, *ret;
+    PyObject *file = NULL, *ret, *tmp;
     char *sep = "";
     Py_ssize_t nin = -1;
     static char *kwlist[] = {"file", "dtype", "count", "sep", NULL};
     PyArray_Descr *type = NULL;
-    int own;
-    npy_off_t orig_pos;
-    FILE *fp;
+    int own, num_els;
+    npy_off_t orig_pos, seek_pos;
 
+    /* parse arguments and keywords */
     if (!PyArg_ParseTupleAndKeywords(args, keywds,
                 "O|O&" NPY_SSIZE_T_PYFMT "s", kwlist,
                 &file, PyArray_DescrConverter, &type, &nin, &sep)) {
         Py_XDECREF(type);
         return NULL;
     }
+
+    /* if passed string, create file. otherwise, require it be file-like */
     if (PyString_Check(file) || PyUnicode_Check(file)) {
         file = npy_PyFile_OpenFile(file, "rb");
         if (file == NULL) {
             return NULL;
         }
         own = 1;
-    }
-    else {
+    } else if (PyArray_IsFileLike(file)) {
         Py_INCREF(file);
         own = 0;
+
+        /* capture original position if supported */
+        if (PyObject_HasAttrString(file, "tell")) {
+            tmp = PyObject_CallMethod(file, "tell", NULL);
+            if (tmp == NULL) {
+                return NULL;
+            }
+            orig_pos = (npy_off_t)PyInt_AsLong(tmp);
+            Py_DECREF(tmp);
+        }
     }
-    fp = npy_PyFile_Dup2(file, "rb", &orig_pos);
-    if (fp == NULL) {
+    else {
         PyErr_SetString(PyExc_IOError,
-                "first argument must be an open file");
+                        "first argument must be an open file");
         Py_DECREF(file);
         return NULL;
     }
+
     if (type == NULL) {
         type = PyArray_DescrFromType(NPY_DEFAULT_TYPE);
     }
-    ret = PyArray_FromFile(fp, type, (npy_intp) nin, sep);
 
-    if (npy_PyFile_DupClose2(file, fp, orig_pos) < 0) {
-        goto fail;
+    /* Call PyArray_FromFileLike */
+    ret = PyArray_FromFileLike(file, type, (npy_intp) nin, sep);
+    
+    /* Close the file if we made it */
+    if (ret != NULL && own) {
+        tmp = PyObject_CallMethod(file, "close", NULL);
+        if (tmp == NULL) {
+            goto fail;
+        }
+        Py_DECREF(tmp);
     }
-    if (own && npy_PyFile_CloseFile(file) < 0) {
-        goto fail;
+    /* seek to proper position */
+    else if (ret != NULL && PyObject_HasAttrString(file, "tell")) {
+        if (nin < 0) {
+            /* seek to end of file */
+            tmp = PyObject_CallMethod(file, "seek", "ii",
+                                      0, SEEK_END);
+        }
+        else {
+            /* seek to original position + read */
+            seek_pos = orig_pos + nin * type->elsize;
+            tmp = PyObject_CallMethod(file, "seek", "i", seek_pos);
+        }
+
+        /* ignore failure */
+        if (tmp == NULL) {
+            PyErr_Clear();
+        }
     }
+
     Py_DECREF(file);
     return ret;
 
@@ -2025,6 +2076,7 @@ fail:
     Py_DECREF(ret);
     return NULL;
 }
+
 
 static PyObject *
 array_fromiter(PyObject *NPY_UNUSED(ignored), PyObject *args, PyObject *keywds)

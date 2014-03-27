@@ -127,7 +127,7 @@ class RoundtripTest(object):
         self.check_roundtrips(a)
 
         a = np.array([[1, 2], [3, 4]], float)
-        self.check_roundtrips(a)
+        self.check_roundtrips(a) #here
 
         a = np.array([[1, 2], [3, 4]], int)
         self.check_roundtrips(a)
